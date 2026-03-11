@@ -4,6 +4,7 @@
 > Last updated: March 11, 2026
 
 ---
+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
 
 ## Part 1 — Architecture Decisions (Finalized)
 
