@@ -1,0 +1,478 @@
+# SDLC Copilot → SDLC Agent: Product Evolution Plan
+
+> Living document capturing architecture decisions, validated findings, and the phased build roadmap.
+> Last updated: March 11, 2026
+
+---
+
+## Part 1 — Architecture Decisions (Finalized)
+
+### Decision 1: Keep GitHub Copilot SDK ✅
+
+**Confirmed.** Organization trusts Microsoft/GitHub for data sovereignty — no data leaves the boundary. Billing is not a concern. The SDK is backed by GitHub, actively developed (v0.1.32+, 29+ releases), and the BYOK escape hatch exists if ever needed. The `copilot` CLI binary dependency is an operational concern to address in deployment packaging (Docker image must include it).
+
+---
+
+### Decision 2: No pgvector / Vector DB — Current KB Approach is Right ✅
+
+**Confirmed and analytically validated.** The `fetch_kb_file` tool + INDEX.md navigation + LRU cache is the correct approach for this use case.
+
+**Why it works:**
+
+The typical UD conversation context budget:
+```
+System prompt + INDEX.md + README.md:     ~8-12K tokens
+User messages (3-4 rounds):               ~2-4K tokens
+Assistant messages (questions + draft):   ~8-15K tokens
+Fetched KB files (6-8 files × ~4K avg):  ~24-32K tokens
+─────────────────────────────────────────────────────
+Total:                                    ~42-63K tokens
+```
+Most Copilot models have 128K-200K context windows. Peak usage is ~30-50% of window. `infiniteSessions` handles compaction if ever needed. There is no context pressure problem.
+
+**Why pgvector is premature:**
+- GitHub Agentic Workflows auto-generate `INDEX.md` and supporting docs on every PR merge to main → the primary failure mode of INDEX-based navigation (stale index) is already solved
+- A typical requirement touches 2-3 existing modules → 2-3 KB files → 8-10 files across a full conversation at most
+- pgvector would add: PostgreSQL dependency, embedding pipeline per KB update, chunking strategy decisions, embedding model costs, and new failure modes — for no measurable benefit at current scale
+
+**Revisit pgvector only if:** KB exceeds ~150 files OR users consistently report "the AI didn't find relevant info." PostgreSQL will already be in place by then (Phase 1), making pgvector a low-cost add-on at that point.
+
+**Two small improvements to make instead (low effort, high value):**
+
+1. **Add size guard in `fetch_kb_file`** — currently `knowledgeBase.ts` has no per-file size limit. If a KB file exceeds ~30K chars it goes straight into context unchecked. Add truncation with a note (same pattern as `copilot.ts` summarizer):
+
+   ```typescript
+   // In knowledgeBase.ts → fetchKBFileContent(), after githubFetch()
+   const MAX_KB_FILE_CHARS = 30_000;
+   if (content.length > MAX_KB_FILE_CHARS) {
+     content = content.slice(0, MAX_KB_FILE_CHARS) +
+       "\n\n⚠️ [File truncated at 30,000 characters]";
+   }
+   ```
+
+2. **Make INDEX.md entries descriptive** — the LLM decides which files to fetch based on how well INDEX entries describe content. Auto-generated INDEX should include 1-line descriptions per file, not just file paths:
+   ```markdown
+   ## Good
+   - `payments.md` — PaymentService, refund logic, retry policies, webhook handlers
+   
+   ## Not enough
+   - `payments.md`
+   ```
+   Ensure the Agentic Workflow prompt that generates INDEX.md produces descriptive entries.
+
+---
+
+### Decision 3: Multi-Project KB Mapping ✅
+
+Users select which project they want to work on → backend maps project name to its KB repo from a stored config. All KB repo configurations stored in a `projects` database table rather than env vars. This supports multiple teams/projects from a single deployment.
+
+---
+
+### Decision 4: Session Management Improvements ✅
+
+- **Redis for session metadata** — SDK sessions stay in-process (not serializable), Redis tracks ownership per server instance for sticky routing in multi-instance deployments
+- **PostgreSQL for message persistence** — every user/assistant message stored; conversation history survives server restarts; fresh SDK session created on restart with prior context injected
+
+---
+
+### Decision 5: SSE Event Abstraction via EventBus ✅
+
+Decouple SDK events from the HTTP response writer. SDK events → EventBus → multiple independent consumers (SSE writer, message persister, metrics collector, future WebSocket transport). Enables testability and future extensibility without touching the SDK integration.
+
+---
+
+### Decision 6: Copilot SDK Session Hooks for Observability ✅
+
+Use SDK's built-in hooks for LLM-level tracing without modifying business logic:
+- `onSessionStart` → log session creation (model, mode, userId, projectId)
+- `onPreToolUse` → log tool name, args (sanitized), timestamp
+- `onPostToolUse` → log result size, latency, success/failure
+- `onErrorOccurred` → log errors with context, decide retry/skip/abort
+- `onSessionEnd` → log session duration, total message count, total tool calls
+
+---
+
+## Part 2 — Current Architecture Assessment
+
+### What's Solid (Keep As-Is)
+
+| Component | Verdict | Notes |
+|---|---|---|
+| `@github/copilot-sdk` | ✅ Keep | Data sovereignty confirmed, billing accepted |
+| Express 4 + middleware stack | ✅ Keep | Helmet, cors, rate-limiting, auth — fundamentally sound |
+| `mode + system prompt + tools` pattern | ✅ Keep | Right extensibility pattern for new SDLC modes |
+| Turborepo + npm workspaces | ✅ Keep | No reason to change |
+| `fetch_kb_file` tool + LRU cache | ✅ Keep | Sufficient for current and projected scale |
+| `create_ud_file` tool | ✅ Keep | Pattern is correct |
+| Request coalescing (inflight Map) | ✅ Keep | Prevents duplicate GitHub API calls |
+| `validateChatRequest`, `timingSafeEqual` | ✅ Keep | Security is correct |
+
+### What Needs to Change for Production
+
+| Gap | Impact | Phase |
+|---|---|---|
+| No observability (console.log everywhere) | Can't operate blind in production | P0 |
+| No message persistence (lost on restart) | Users lose all conversations | P0 |
+| Single KB repo via env vars | Can't serve multiple projects/teams | P0 |
+| No artifact persistence (Blob URL = ephemeral) | Generated UDs lost on page refresh | P1 |
+| In-process Map = single instance only | Can't horizontally scale | P1 |
+| SSE tightly coupled to SDK event handlers | Hard to test, add consumers, change transport | P1 |
+| Only 3 modes (summarize, chat, ud) | Covers only requirements phase of SDLC | P2 |
+| API key auth only | Enterprise needs OAuth/SSO + RBAC | P2 |
+
+### What's Missing for a True SDLC Product
+
+SDLC coverage map:
+
+| SDLC Phase | Current | Target |
+|---|---|---|
+| Requirements gathering | ✅ KB Chat, UD Creator | UD review/gap analysis mode |
+| Design | ❌ | HLD/LLD generation mode |
+| Development | ⚡ File Summarizer only | PR review, code explanation mode |
+| Testing | ❌ | Test case generation from UD |
+| Release | ❌ | Release notes generation |
+| Maintenance | ❌ | Incident root cause analysis |
+
+---
+
+## Part 3 — Build Roadmap
+
+### Phase 1 — Production Foundation (P0)
+
+#### 1.1 Observability: Structured Logging + LLM Tracing
+
+**Files to create/modify:**
+- New `apps/server/src/lib/logger.ts` — pino singleton with base context (env, version)
+- New `apps/server/src/lib/metrics.ts` — in-process counters + `/metrics` route
+- `apps/server/src/index.ts` — replace all console calls with logger, add request timing middleware
+- `apps/server/src/chatAgent.ts` — add `hooks` config to every `client.createSession()` call (all 6 SDK hooks)
+- `apps/server/src/copilot.ts` — structured logging around SDK calls
+- `apps/server/src/routes/chat.ts` — log request start/end, message length, mode, projectId
+- `apps/server/src/routes/summarize.ts` — log file size, truncation, latency
+- `apps/server/package.json` — add `pino`, `pino-pretty`
+
+**What each hook logs:**
+```typescript
+hooks: {
+  onSessionStart:  ({ source }) => logger.info({ event: "session.start", source, model, mode, userId }),
+  onPreToolUse:    ({ toolName, toolArgs }) => logger.info({ event: "tool.start", toolName, sessionKey }),
+  onPostToolUse:   ({ toolName, success }) => logger.info({ event: "tool.end", toolName, success, latencyMs }),
+  onErrorOccurred: ({ error, errorContext }) => logger.error({ event: "session.error", error, errorContext }),
+  onSessionEnd:    ({ reason }) => logger.info({ event: "session.end", reason }),
+}
+```
+
+---
+
+#### 1.2 Message Persistence: PostgreSQL
+
+**Database table:**
+```sql
+CREATE TABLE messages (
+  id            BIGSERIAL PRIMARY KEY,
+  session_key   TEXT NOT NULL,
+  user_id       TEXT NOT NULL,
+  project_id    TEXT,
+  role          TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
+  content       TEXT NOT NULL,
+  mode          TEXT NOT NULL,
+  tool_name     TEXT,               -- populated for role='tool'
+  tool_args     JSONB,              -- populated for role='tool'
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX ON messages (session_key, created_at);
+CREATE INDEX ON messages (user_id, created_at);
+```
+
+**Files to create/modify:**
+- New `apps/server/src/lib/db.ts` — PostgreSQL pool (`pg` package), connection lifecycle
+- New `apps/server/src/lib/message-store.ts` — `insertMessage()`, `getMessages(sessionKey, limit)`, `getRecentContext(sessionKey, n)`
+- `apps/server/src/routes/chat.ts` — persist user message before `session.send()`, persist assistant response in `session.idle` handler, persist tool calls in `tool.execution_start`
+- New `apps/server/src/routes/history.ts` — `GET /api/chat/history/:sessionId` returns messages
+- `apps/server/src/chatAgent.ts` — on new session creation, fetch last N messages from DB, inject as context in system prompt prefix
+- `apps/web/src/components/ChatInterface.tsx` — fetch history on mount, render prior messages
+- `apps/server/package.json` — add `pg`, `@types/pg`
+
+**Context recovery on restart:**
+```typescript
+// In getOrCreateSession() — when creating a NEW SDK session for an existing sessionKey
+const priorMessages = await messageStore.getRecentContext(sessionKey, 20);
+if (priorMessages.length > 0) {
+  const contextPrefix = formatMessagesAsContext(priorMessages);
+  systemPromptContent = contextPrefix + "\n\n" + systemPromptContent;
+}
+```
+
+---
+
+#### 1.3 Multi-Project KB Mapping
+
+**Database table:**
+```sql
+CREATE TABLE projects (
+  id                   TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  name                 TEXT NOT NULL UNIQUE,       -- slug: "payments-api"
+  display_name         TEXT NOT NULL,              -- "Payments API"
+  kb_repo_owner        TEXT NOT NULL,
+  kb_repo_name         TEXT NOT NULL,
+  kb_repo_ref          TEXT NOT NULL DEFAULT 'main',
+  kb_core_files        TEXT[] DEFAULT ARRAY['INDEX.md', 'README.md'],
+  kb_file_extensions   TEXT[] DEFAULT ARRAY['.md'],
+  created_at           TIMESTAMPTZ DEFAULT NOW(),
+  updated_at           TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Files to create/modify:**
+- New `apps/server/src/lib/project-store.ts` — `listProjects()`, `getProject(id)`, `createProject()`, `updateProject()`, `deleteProject()`
+- `apps/server/src/knowledgeBase.ts` — refactor: `KnowledgeBaseService` becomes multi-project factory. `getKBForProject(projectId)` returns a project-specific instance with its own core files cache and LRU cache. Core files loaded lazily on first request.
+- New `apps/server/src/routes/projects.ts` — `GET /api/projects`, `POST /api/projects`, `PUT /api/projects/:id`, `DELETE /api/projects/:id` (admin-only creates/updates)
+- `apps/server/src/middleware/validate.ts` — add `projectId` to `validateChatRequest`
+- `apps/server/src/chatAgent.ts` — accept `projectId`, session key becomes `${userId}:${sessionId}:${mode}:${projectId}`, pass project-specific KB to prompt assembly
+- `packages/shared/src/index.ts` — add `projectId` to `ChatRequest`, add `Project` interface
+- `apps/web/src/components/ChatInterface.tsx` — add project selector; send `projectId` with every request
+- `apps/web/src/app/page.tsx` — project selection step before entering chat
+
+---
+
+### Phase 2 — Resilience & Scale (P1)
+
+#### 2.1 Redis: Session Metadata + Sticky Routing
+
+SDK sessions are not serializable — they hold live JSON-RPC connections to the CLI process. Strategy: in-process `Map` keeps live sessions, Redis keeps metadata to support sticky routing in multi-instance deployments.
+
+**Redis key structure:**
+```
+session:metadata:{sessionKey}  →  { userId, mode, projectId, instanceId, lastUsedAt, createdAt }  TTL: 35min
+instance:sessions:{instanceId} →  SET of sessionKeys hosted on this instance
+```
+
+**Files to create/modify:**
+- New `apps/server/src/lib/redis.ts` — ioredis client, connection lifecycle
+- New `apps/server/src/lib/session-registry.ts` — `register()`, `touch()`, `unregister()`, `getOwnerInstance()`, `isAlive()`
+- `apps/server/src/chatAgent.ts` — sync session lifecycle with Redis (on create, destroy, idle)
+- `apps/server/src/index.ts` — Redis connection open/close in startup/shutdown
+- `apps/server/package.json` — add `ioredis`
+
+**Load balancer config:** sticky sessions by cookie (`SDLC_INSTANCE_ID`) or IP hash.
+
+---
+
+#### 2.2 SSE Event Abstraction Layer (EventBus)
+
+Replace the tight coupling in `routes/chat.ts` (SDK event → `res.write()` directly) with a typed EventBus.
+
+```
+SDK events
+    │
+    ▼
+EventBus (typed Node.js EventEmitter)
+    ├── SSE Writer        → res.write() per event type
+    ├── Message Persister → messageStore.insertMessage()
+    ├── Metrics Collector → increment counters, record latency
+    └── Audit Logger      → structured log with user + content reference
+```
+
+**Files to create/modify:**
+- New `apps/server/src/lib/event-bus.ts` — typed EventEmitter, maps SDK event types to normalized internal event types
+- New `apps/server/src/lib/event-handlers/sse-writer.ts`
+- New `apps/server/src/lib/event-handlers/message-persister.ts`
+- New `apps/server/src/lib/event-handlers/metrics-collector.ts`
+- `apps/server/src/routes/chat.ts` — replace per-event `res.write()` calls with EventBus emissions; SSE writer subscribes to bus; cleanup still via `res.on("close")`
+
+---
+
+#### 2.3 Artifact Storage
+
+**Problem:** `create_ud_file` produces a `Blob` URL on the frontend — ephemeral, lost on page refresh.
+
+**Database table:**
+```sql
+CREATE TABLE artifacts (
+  id            TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  session_key   TEXT NOT NULL,
+  user_id       TEXT NOT NULL,
+  project_id    TEXT,
+  filename      TEXT NOT NULL,
+  content       TEXT NOT NULL,
+  artifact_type TEXT NOT NULL DEFAULT 'ud',   -- 'ud' | 'hld' | 'test-cases' | 'release-notes'
+  version       INT NOT NULL DEFAULT 1,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX ON artifacts (user_id, project_id, created_at);
+```
+
+**Files to create/modify:**
+- New `apps/server/src/lib/artifact-store.ts` — `saveArtifact()`, `getArtifact(id)`, `listArtifacts(userId, projectId)`
+- New `apps/server/src/routes/artifacts.ts` — `GET /api/artifacts`, `GET /api/artifacts/:id` (download), `DELETE /api/artifacts/:id`
+- `apps/server/src/routes/chat.ts` — in `tool.execution_start` handler for `create_ud_file`, also call `artifactStore.saveArtifact()`; include artifact `id` in `ud_file_ready` SSE payload
+- `packages/shared/src/index.ts` — add `artifactId` to `UDFilePayload`
+- `apps/web/src/components/ChatInterface.tsx` — show artifact history panel; use `/api/artifacts/:id` URL instead of Blob URL; revoke Blob URL after persisting
+
+---
+
+### Phase 3 — SDLC Expansion (P2)
+
+#### 3.1 New Agent Modes
+
+Each new mode follows the existing pattern: system prompt `.md` + tools + mode value in allowlist.
+
+| Mode | Prompt File | New Tools | Description |
+|---|---|---|---|
+| `pr-review` | `pr-review-prompt.md` | `fetch_pr_diff`, `fetch_pr_files`, `fetch_kb_file` | Analyze PR diffs against KB standards |
+| `test-gen` | `test-gen-prompt.md` | `fetch_kb_file`, `create_test_file` | Generate test cases from UD or requirements |
+| `hld` | `hld-prompt.md` | `fetch_kb_file`, `create_hld_file` | High-Level Design from requirements |
+| `release-notes` | `release-notes-prompt.md` | `fetch_commits`, `fetch_prs_between_tags` | Summarise changes between releases |
+| `incident` | `incident-prompt.md` | `fetch_kb_file` | Root cause analysis from incident description |
+
+**For each new mode, touch:**
+1. New `apps/server/src/prompts/{mode}-prompt.md`
+2. `apps/server/src/prompts/prompt-loader.ts` — add loader function
+3. `apps/server/src/middleware/validate.ts` — add to mode allowlist
+4. `apps/server/src/chatAgent.ts` — add `if (mode === "...")` branch
+5. `packages/shared/src/index.ts` — add to `ChatRequest` mode union type
+6. `apps/web/src/components/ChatInterface.tsx` — add mode button + UI
+
+**New GitHub API tools** (shared across modes, new file `apps/server/src/tools/github-tools.ts`):
+- `fetch_pr_diff(owner, repo, prNumber)` — PR diff via GitHub API
+- `fetch_pr_files(owner, repo, prNumber)` — list of changed files in PR
+- `fetch_commits(owner, repo, since, until)` — commit list between dates/tags/SHAs
+
+---
+
+#### 3.2 OAuth/SSO + RBAC
+
+**Database tables:**
+```sql
+CREATE TABLE users (
+  id         TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  email      TEXT NOT NULL UNIQUE,
+  name       TEXT,
+  sso_id     TEXT UNIQUE,           -- Azure AD / GitHub OAuth ID
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE roles (
+  id         BIGSERIAL PRIMARY KEY,
+  user_id    TEXT NOT NULL REFERENCES users(id),
+  project_id TEXT REFERENCES projects(id),  -- NULL = global role
+  role       TEXT NOT NULL CHECK (role IN ('admin', 'analyst', 'developer', 'viewer')),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (user_id, project_id, role)
+);
+```
+
+**Role → mode access:**
+| Role | Modes Allowed |
+|---|---|
+| viewer | `chat` |
+| analyst | `chat`, `ud`, `test-gen` |
+| developer | `chat`, `summarize`, `pr-review`, `hld` |
+| admin | All modes + project management endpoints |
+
+**Files to create/modify:**
+- `apps/server/src/middleware/auth.ts` — add OAuth token validation (Azure AD / GitHub OAuth); maintain backward compat with API key auth for service accounts
+- New `apps/server/src/middleware/authorize.ts` — `authorize(requiredRole)` middleware; reads role from DB by userId + projectId
+- New `apps/server/src/routes/auth.ts` — `/auth/login`, `/auth/callback`, `/auth/refresh`
+- New `apps/server/src/lib/user-store.ts`
+- `apps/web/src/app/layout.tsx` — auth context/provider
+- New `apps/web/src/components/LoginPage.tsx`
+
+---
+
+#### 3.3 Prompt Versioning
+
+```sql
+CREATE TABLE prompt_templates (
+  id          BIGSERIAL PRIMARY KEY,
+  mode        TEXT NOT NULL,
+  project_id  TEXT REFERENCES projects(id),  -- NULL = global default
+  version     INT NOT NULL DEFAULT 1,
+  content     TEXT NOT NULL,
+  is_active   BOOLEAN NOT NULL DEFAULT FALSE,
+  created_by  TEXT REFERENCES users(id),
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+- Per-project prompt overrides: different organizations use different UD templates
+- Version tracking: which prompt version produced a given artifact
+- Admin API: edit/preview/activate prompt templates
+- `prompt-loader.ts` checks DB first, falls back to file-based defaults
+
+---
+
+### Phase 4 — Polish (P3)
+
+#### 4.1 Error Handling & Resilience
+- **Circuit breaker** for GitHub API calls — `opossum` library; fail fast when GitHub API is down; fallback to LRU cache if possible
+- **SDK process crash recovery** — catch `session.send()` failures caused by dead CLI process; attempt session recreation once before surfacing error to user
+- **Graceful degradation UX** — if KB unavailable, show dismissible banner but allow general chat
+
+#### 4.2 Security Hardening
+- **Prompt injection defense** — detect common injection patterns in user input before sending to SDK; log suspicious inputs
+- **Audit log table:**
+  ```sql
+  CREATE TABLE audit_log (
+    id         BIGSERIAL PRIMARY KEY,
+    user_id    TEXT,
+    action     TEXT NOT NULL,
+    resource   TEXT,
+    details    JSONB,
+    ip         INET,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  ```
+- **Per-tenant rate limiting** — current rate limiter is global; add tenant-level quotas
+- **Content Security Policy** — tighten Helmet CSP headers for Next.js frontend
+
+#### 4.3 Frontend Improvements
+- Conversation sidebar — list past sessions by project, click to reload history
+- Markdown editor for UD review/editing before approval
+- Export options — PDF (client-side `jspdf`), Confluence push, Jira ticket creation
+- Keyboard shortcuts — Ctrl+Enter to send, Ctrl+N for new chat
+
+---
+
+## Part 4 — Database Schema Summary
+
+```sql
+-- Phase 1
+projects        (id, name, display_name, kb_repo_owner, kb_repo_name, kb_repo_ref, kb_core_files[], kb_file_extensions[], created_at, updated_at)
+messages        (id, session_key, user_id, project_id, role, content, mode, tool_name, tool_args, created_at)
+artifacts       (id, session_key, user_id, project_id, filename, content, artifact_type, version, created_at)
+
+-- Phase 3
+users           (id, email, name, sso_id, created_at)
+roles           (id, user_id, project_id, role, created_at)
+prompt_templates(id, mode, project_id, version, content, is_active, created_by, created_at)
+
+-- Phase 4
+audit_log       (id, user_id, action, resource, details, ip, created_at)
+```
+
+---
+
+## Part 5 — New Dependencies by Phase
+
+| Package | Phase | Purpose |
+|---|---|---|
+| `pino` + `pino-pretty` | Phase 1 | Structured JSON logging |
+| `pg` + `@types/pg` | Phase 1 | PostgreSQL client |
+| `ioredis` | Phase 2 | Redis client for session metadata |
+| `opossum` | Phase 4 | Circuit breaker for GitHub API |
+| SSO library (`passport` / `next-auth`) | Phase 3 | OAuth / SSO integration |
+| `jspdf` (optional) | Phase 4 | Client-side PDF export |
+
+---
+
+## Part 6 — KB Quality Checklist (Ongoing)
+
+For the Agentic Workflow that generates KB files on PR merge, ensure:
+
+- [ ] `INDEX.md` entries include a 1-line description of each file's content (not just the filename)
+- [ ] `INDEX.md` is organized by module/domain with clear section headers
+- [ ] Each module doc includes: purpose, key classes/functions, data models, integration points
+- [ ] Docs reference other related files explicitly (helps LLM chain fetches)
+- [ ] No single KB file exceeds 30,000 characters (add size check to generator)
+- [ ] `README.md` gives a high-level project map so LLM can orient itself on first message
